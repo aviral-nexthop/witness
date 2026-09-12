@@ -3,9 +3,8 @@
 
 Two halves, joined by one file:
 
-    capture   a ``rec>`` REPL that runs each command for you over ``nh tb ssh``,
-              snapshots the interesting DB keys before and after, and appends
-              events to ``events.jsonl``.
+    capture   a ``rec>`` REPL that holds one ``nh tb ssh`` login. Reads run
+              as-is; writes dump only the named port, in the same round trip.
     curate    a reader/pruner/renderer that turns ``events.jsonl`` into a repro
               timeline you can paste into a ticket.
 
@@ -15,7 +14,7 @@ curate side runs off a fixture file and never needs a testbed.
 Usage:
     witness start <testbed> [--nos sonic]     # record a session
     witness trim [SESSION]                    # keep/drop curation pass
-    witness export [SESSION] [--paste]        # markdown timeline / wastebin URL
+    witness export [SESSION] [--paste]        # markdown + session/repro.sh; --paste → wastebin URL
     witness demo [SESSION]                    # replay a recording, no network
     witness show [SESSION]                    # one line per recorded step
 
@@ -26,13 +25,22 @@ recent recording under ~/.cmdrec.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
+import pty
+import queue
 import re
+import secrets
+import select
 import shlex
+import struct
 import subprocess
 import sys
+import termios
+import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,13 +52,22 @@ KEY_ALLOWLIST: tuple[tuple[str, str], ...] = (
     ("STATE_DB", "PORT_TABLE|*"),
 )
 
-# Fixed settle window. SPINE uses keyspace notifications to close this adaptively;
-# in a demo the two are indistinguishable.
-SETTLE_SECONDS = 1.5
+# Writes only. Reads skip the wait. SPINE would close this from keyspace notices.
+SETTLE_SECONDS = 0.5
 
 SSH_TIMEOUT = 120
 SNAPSHOT_TIMEOUT = 60
+DUMP_TIMEOUT = 12
+WRITE_TIMEOUT = 30
 SNAPSHOT_MARKER = "###CMDREC "
+READY_PREFIX = "###CMDREC READY "
+DONE_PREFIX = "###CMDREC DONE "
+PORT_NAME_RE = re.compile(r"\b(Ethernet\d+|PortChannel\d+|Vlan\d+|Loopback\d+)\b", re.IGNORECASE)
+# A PTY makes sudo prompt and wait forever; -n fails immediately if a password would be needed.
+SUDO_RE = re.compile(r"(^|[\s;|&])sudo(?=\s)(?!\s+-n\b)")
+# sonic-db-dump JSON must not wrap; a default 80-col PTY would split keys.
+PTY_ROWS = 50
+PTY_COLS = 1024
 
 SESSIONS_ROOT = Path(os.environ.get("CMDREC_HOME", Path.home() / ".cmdrec"))
 
@@ -106,6 +123,33 @@ def is_read_only(cmd: str) -> bool:
     return any(stripped.startswith(prefix) for prefix in READ_ONLY_PREFIXES)
 
 
+def force_sudo_n(cmd: str) -> str:
+    """``sudo -n`` never blocks on a password prompt."""
+    return SUDO_RE.sub(r"\1sudo -n", cmd)
+
+
+def extract_ports(cmd: str) -> list[str]:
+    """Port names mentioned in the command, in SONiC casing, first-seen order."""
+
+    def normalize(name: str) -> str:
+        for prefix in ("Ethernet", "PortChannel", "Vlan", "Loopback"):
+            if name.lower().startswith(prefix.lower()):
+                return prefix + name[len(prefix) :]
+        return name
+
+    return list(dict.fromkeys(normalize(match) for match in PORT_NAME_RE.findall(cmd)))
+
+
+def snapshot_patterns(ports: list[str]) -> list[tuple[str, str]]:
+    """Exact keys for the ports the command named — not ``PORT|*``."""
+    patterns: list[tuple[str, str]] = []
+    for port in ports:
+        patterns.append(("CONFIG_DB", f"PORT|{port}"))
+        patterns.append(("APPL_DB", f"PORT_TABLE:{port}"))
+        patterns.append(("STATE_DB", f"PORT_TABLE|{port}"))
+    return patterns
+
+
 def port_object(key: str) -> str | None:
     """``PORT|Ethernet24``, ``PORT_TABLE:Ethernet24`` and ``PORT_TABLE|Ethernet24`` all
     name the same port. Everything downstream keys off that shared token."""
@@ -129,36 +173,137 @@ class RunResult:
     ms: int
 
 
+def _set_winsize(fd: int, rows: int = PTY_ROWS, cols: int = PTY_COLS) -> None:
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+
+
 class Switch:
-    """Everything that needs a live box. One subprocess per command, no PTY."""
+    """One ``nh tb ssh`` login for the whole recording.
+
+    A background thread drains the PTY so a large dump cannot stall the
+    session. Commands are delimited by a unique marker. A timeout sends
+    Ctrl-C and resyncs the same login instead of opening a new one.
+    """
 
     def __init__(self, spec: str, nos: str | None = None) -> None:
         self.spec = spec
         self.nos = nos
+        self._proc: subprocess.Popen[bytes] | None = None
+        self._master: int | None = None
+        self._lines: queue.Queue[str] = queue.Queue()
+        self._reader: threading.Thread | None = None
+        self._reader_stop = threading.Event()
 
-    def _argv(self, command: str) -> list[str]:
+    def _login_argv(self) -> list[str]:
         argv = ["nh", "tb", "ssh"]
         if self.nos:
             argv += ["--nos", self.nos]
-        return argv + [self.spec, "-c", command]
+        return argv + [self.spec]
+
+    def _alive(self) -> bool:
+        return self._proc is not None and self._proc.poll() is None and self._master is not None
+
+    def close(self) -> None:
+        self._reader_stop.set()
+        proc, master, reader = self._proc, self._master, self._reader
+        self._proc = None
+        self._master = None
+        self._reader = None
+        if master is not None:
+            try:
+                os.write(master, b"exit\n")
+            except OSError:
+                pass
+            try:
+                os.close(master)
+            except OSError:
+                pass
+        if reader is not None:
+            reader.join(timeout=1)
+        if proc is not None:
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        self._drain(0)
+
+    def connect(self) -> None:
+        if self._alive():
+            return
+        self.close()
+        self._reader_stop.clear()
+        self._lines = queue.Queue()
+        master, slave = pty.openpty()
+        try:
+            _set_winsize(slave)
+            self._proc = subprocess.Popen(
+                self._login_argv(),
+                stdin=slave,
+                stdout=slave,
+                stderr=slave,
+                close_fds=True,
+                start_new_session=True,
+            )
+        except FileNotFoundError:
+            os.close(master)
+            os.close(slave)
+            raise
+        os.close(slave)
+        self._master = master
+        self._reader = threading.Thread(target=self._reader_loop, name="witness-ssh", daemon=True)
+        self._reader.start()
+        try:
+            if not self._alive():
+                raise ConnectionError(self._scraped() or "nh tb ssh exited during login")
+            # Handshake retries until a shell answers. nh's password prompt is
+            # on pexpect's own pty; bytes we send queue until interact() starts.
+            self._handshake()
+        except (TimeoutError, ConnectionError, OSError):
+            err = self._scraped()
+            self.close()
+            raise ConnectionError(err or "ssh session failed") from None
 
     def run(self, command: str, timeout: int = SSH_TIMEOUT) -> RunResult:
         started = time.monotonic()
+        marker = DONE_PREFIX + secrets.token_hex(8)
+        quoted = shlex.quote(force_sudo_n(command))
+        cap = max(1, int(timeout) - 2)
+        # One line: SONiC ``config`` reads /dev/tty and swallows a following
+        # printf if we send it as a second PTY line — that was the 120s hang
+        # (the change still applied). setsid drops the controlling TTY; timeout
+        # guarantees the printf still runs if the command wedges.
+        script = (
+            f"if command -v setsid >/dev/null 2>&1; then "
+            f"timeout {cap} setsid -w sh -c {quoted} </dev/null; "
+            f"else timeout {cap} sh -c {quoted} </dev/null; fi; "
+            f"printf '%s %d\\n' {shlex.quote(marker)} $?"
+        )
         try:
-            proc = subprocess.run(
-                self._argv(command),
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                check=False,
-            )
-            out = proc.stdout + (proc.stderr if proc.returncode else "")
-            code = proc.returncode
-        except subprocess.TimeoutExpired:
-            out, code = f"witness: timed out after {timeout}s\n", 124
+            return self._transact(script, marker, timeout, started)
         except FileNotFoundError:
-            out, code = "witness: `nh` not found on PATH\n", 127
-        return RunResult(out=out.rstrip("\n"), exit_code=code, ms=int((time.monotonic() - started) * 1000))
+            return RunResult(out="witness: `nh` not found on PATH", exit_code=127, ms=_elapsed_ms(started))
+
+    def run_tracked(self, command: str, patterns: list[tuple[str, str]], timeout: int = WRITE_TIMEOUT) -> tuple[RunResult, Snapshot, Snapshot]:
+        """Dump, run the write, settle, dump — three small commands on the same login."""
+        started = time.monotonic()
+        empty: Snapshot = {db: {} for db, _ in KEY_ALLOWLIST}
+        before = self._snapshot_keys(patterns)
+        result = self.run(command, timeout=timeout)
+        if result.exit_code in (124, 127, 255):
+            return RunResult(result.out, result.exit_code, _elapsed_ms(started)), before, empty
+        time.sleep(SETTLE_SECONDS)
+        after = self._snapshot_keys(patterns)
+        return RunResult(result.out, result.exit_code, _elapsed_ms(started)), before, after
+
+    def _snapshot_keys(self, patterns: list[tuple[str, str]]) -> Snapshot:
+        empty: Snapshot = {db: {} for db, _ in KEY_ALLOWLIST}
+        if not patterns:
+            return empty
+        result = self.run(self._dump_script(patterns), timeout=DUMP_TIMEOUT)
+        if not result.out:
+            return empty
+        return self._parse_snapshot(result.out)
 
     def environment(self) -> dict[str, str]:
         """Build, platform and NOS version, captured once so the timeline has a header."""
@@ -182,19 +327,151 @@ class Switch:
                 env["version"] = uname.out.strip()
         return env
 
-    def snapshot(self) -> dict[str, dict[str, dict[str, str]]]:
-        """One SSH round trip for the whole allowlist: {db: {key: {field: value}}}."""
-        parts: list[str] = []
-        for db, pattern in KEY_ALLOWLIST:
-            parts.append(f"echo {shlex.quote(SNAPSHOT_MARKER + db)}")
-            dump = f"sudo sonic-db-dump -n {shlex.quote(db)} -k {shlex.quote(pattern)} -y"
-            parts.append(f"{dump} 2>/dev/null || echo '{{}}'")
-        result = self.run("; ".join(parts), timeout=SNAPSHOT_TIMEOUT)
-        return self._parse_snapshot(result.out)
+    def _transact(self, script: str, marker: str, timeout: float, started: float) -> RunResult:
+        try:
+            if not self._alive():
+                self.connect()
+        except FileNotFoundError:
+            raise
+        except (ConnectionError, OSError) as exc:
+            return RunResult(out=f"witness: {exc}", exit_code=255, ms=_elapsed_ms(started))
+        try:
+            self._send(script.rstrip() + "\n")
+            lines, trailer = self._read_until(
+                lambda line: line == marker or line.startswith(marker + " "),
+                timeout=timeout,
+            )
+        except TimeoutError:
+            self._recover_after_timeout()
+            return RunResult(out=f"witness: timed out after {timeout}s", exit_code=124, ms=_elapsed_ms(started))
+        except (ConnectionError, OSError) as exc:
+            self.close()
+            return RunResult(out=f"witness: ssh session closed: {exc}", exit_code=255, ms=_elapsed_ms(started))
+        rest = trailer[len(marker) :].strip()
+        try:
+            code = int(rest)
+        except ValueError:
+            code = 0
+        return RunResult(out="\n".join(lines).rstrip("\n"), exit_code=code, ms=_elapsed_ms(started))
+
+    def _handshake(self) -> None:
+        ready = READY_PREFIX + secrets.token_hex(8)
+        # Stay in the login shell — `exec bash --noprofile` would drop PATH.
+        handshake = (
+            f"stty -echo cols {PTY_COLS} rows {PTY_ROWS} 2>/dev/null; "
+            f"PS1=; export PS1; printf '%s\\n' {shlex.quote(ready)}\n"
+        )
+        deadline = time.monotonic() + SSH_TIMEOUT
+        self._send(handshake)
+        while True:
+            if not self._alive():
+                raise ConnectionError(self._scraped() or "remote shell closed")
+            try:
+                self._read_until(lambda line: line == ready, timeout=2.5)
+                self._drain(0.1)
+                return
+            except TimeoutError:
+                if time.monotonic() >= deadline:
+                    raise
+                self._send(handshake)
+
+    def _recover_after_timeout(self) -> None:
+        """Keep the login. Interrupt the wedged command and re-handshake."""
+        if not self._alive():
+            self.close()
+            return
+        try:
+            self._send("\x03")
+            self._drain(0.2)
+            self._handshake()
+        except (TimeoutError, ConnectionError, OSError):
+            self.close()
+
+    def _send(self, text: str) -> None:
+        if self._master is None:
+            raise ConnectionError("no ssh session")
+        os.write(self._master, text.encode())
+
+    def _reader_loop(self) -> None:
+        buf = bytearray()
+        while not self._reader_stop.is_set():
+            master = self._master
+            if master is None:
+                break
+            if self._proc is not None and self._proc.poll() is not None:
+                break
+            try:
+                ready, _, _ = select.select([master], [], [], 0.2)
+            except OSError:
+                break
+            if not ready:
+                continue
+            try:
+                chunk = os.read(master, 8192)
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf.extend(chunk)
+            while True:
+                nl = buf.find(b"\n")
+                if nl < 0:
+                    break
+                raw = bytes(buf[:nl])
+                del buf[: nl + 1]
+                self._lines.put(raw.decode("utf-8", errors="replace").rstrip("\r"))
+
+    def _drain(self, seconds: float) -> None:
+        end = time.monotonic() + seconds
+        while True:
+            remaining = end - time.monotonic()
+            try:
+                if remaining <= 0:
+                    self._lines.get_nowait()
+                else:
+                    self._lines.get(timeout=remaining)
+            except queue.Empty:
+                return
+
+    def _scraped(self) -> str:
+        bits: list[str] = []
+        while True:
+            try:
+                bits.append(self._lines.get_nowait())
+            except queue.Empty:
+                return "\n".join(bits)
+
+    def _read_until(self, matches: Callable[[str], bool], timeout: float) -> tuple[list[str], str]:
+        lines: list[str] = []
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError
+            if self._proc is not None and self._proc.poll() is not None and self._lines.empty():
+                raise ConnectionError(self._scraped() or "ssh session closed")
+            try:
+                line = self._lines.get(timeout=remaining)
+            except queue.Empty:
+                raise TimeoutError
+            if matches(line):
+                return lines, line
+            lines.append(line)
 
     @staticmethod
-    def _parse_snapshot(text: str) -> dict[str, dict[str, dict[str, str]]]:
-        snapshot: dict[str, dict[str, dict[str, str]]] = {db: {} for db, _ in KEY_ALLOWLIST}
+    def _dump_script(patterns: list[tuple[str, str]]) -> str:
+        parts: list[str] = []
+        for db, pattern in patterns:
+            parts.append(f"echo {shlex.quote(SNAPSHOT_MARKER + db)}")
+            parts.append(
+                "timeout 8 sudo -n sonic-db-dump "
+                f"-n {shlex.quote(db)} -k {shlex.quote(pattern)} -y 2>/dev/null || echo '{{}}'"
+            )
+        return "; ".join(parts)
+
+    @staticmethod
+    def _parse_snapshot(text: str) -> Snapshot:
+        snapshot: Snapshot = {db: {} for db, _ in KEY_ALLOWLIST}
         current: str | None = None
         buffer: list[str] = []
 
@@ -217,11 +494,15 @@ class Switch:
         for line in text.splitlines():
             if line.startswith(SNAPSHOT_MARKER):
                 flush()
-                current, buffer = line[len(SNAPSHOT_MARKER):].strip(), []
+                current, buffer = line[len(SNAPSHOT_MARKER) :].strip(), []
             elif current is not None:
                 buffer.append(line)
         flush()
         return snapshot
+
+
+def _elapsed_ms(started: float) -> int:
+    return int((time.monotonic() - started) * 1000)
 
 
 Snapshot = dict[str, dict[str, dict[str, str]]]
@@ -293,6 +574,13 @@ class Recorder:
 
     def start(self) -> None:
         self.dir.mkdir(parents=True, exist_ok=True)
+        print(f"connecting {self.switch.spec} …", flush=True)
+        try:
+            self.switch.connect()
+        except FileNotFoundError:
+            sys.exit("witness: `nh` not found on PATH")
+        except (ConnectionError, OSError) as exc:
+            sys.exit(f"witness: {exc}")
         env = self.switch.environment()
         self._append({"event": "meta", "t": utcnow(), **env})
         nos = NOS_LABELS.get(env.get("nos", ""), env.get("nos", "").upper())
@@ -303,8 +591,13 @@ class Recorder:
         print("  commands run on the DUT; `mark <note>` flags a step, `stop` ends the recording.\n")
 
     def run_command(self, cmd: str) -> None:
-        before = self.switch.snapshot()
-        result = self.switch.run(cmd)
+        ports = extract_ports(cmd)
+        if is_read_only(cmd) or not ports:
+            result = self.switch.run(cmd)
+            changes: list[Change] = []
+        else:
+            result, before, after = self.switch.run_tracked(cmd, snapshot_patterns(ports))
+            changes = add_witness_rows(diff_snapshots(before, after), before, after)
         if result.out:
             print(result.out)
         seq = self._append(
@@ -320,9 +613,6 @@ class Recorder:
             }
         )
         self.last_command_seq = seq
-        time.sleep(SETTLE_SECONDS)
-        after = self.switch.snapshot()
-        changes = add_witness_rows(diff_snapshots(before, after), before, after)
         if not changes:
             return
         anomaly = detect_anomaly(changes)
@@ -476,7 +766,8 @@ def prune(steps: list[Step]) -> list[Step]:
     kept: list[Step] = []
     previous_changed = False
     for step in deduped:
-        changed = bool(step.marked or step.changes or step.anomaly)
+        write_ok = step.exit_code == 0 and not is_read_only(step.cmd)
+        changed = bool(step.marked or step.changes or step.anomaly or write_ok)
         keep = changed
         if not keep and step.exit_code == 0 and is_read_only(step.cmd) and previous_changed:
             keep = True  # the read that verifies the change we just kept — but only the first one
@@ -603,9 +894,12 @@ def cmd_start(args: argparse.Namespace) -> int:
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     session_dir = Path(args.dir).expanduser() if args.dir else SESSIONS_ROOT / f"{args.testbed}-{stamp}"
     recorder = Recorder(session_dir, Switch(args.testbed, args.nos))
-    recorder.start()
-    recorder.repl()
-    return 0
+    try:
+        recorder.start()
+        recorder.repl()
+        return 0
+    finally:
+        recorder.switch.close()
 
 
 def cmd_show(args: argparse.Namespace) -> int:
@@ -661,10 +955,12 @@ def cmd_export(args: argparse.Namespace) -> int:
     session = load_session(resolve_session(args.session))
     steps = curated_steps(session)
     markdown = render_markdown(session, steps, len(session.steps))
-    if args.sh:
-        Path(args.sh).write_text(render_script(session, steps), encoding="utf-8")
-        os.chmod(args.sh, 0o755)
-        print(f"wrote {args.sh}", file=sys.stderr)
+    script = render_script(session, steps)
+    dest = Path(args.sh).expanduser() if args.sh else session.dir / "repro.sh"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(script, encoding="utf-8")
+    os.chmod(dest, 0o755)
+    print(f"wrote {dest}", file=sys.stderr)
     if args.paste:
         title = f"repro {session.meta.get('testbed', 'session')}"
         proc = subprocess.run(
@@ -730,7 +1026,11 @@ def build_parser() -> argparse.ArgumentParser:
             node.add_argument("--speed", type=float, default=0.6, help="seconds between steps")
         if name == "export":
             node.add_argument("--paste", action="store_true", help="upload via `nh paste` and print the URL")
-            node.add_argument("--sh", metavar="PATH", help="also write a repro.sh")
+            node.add_argument(
+                "--sh",
+                metavar="PATH",
+                help="write repro.sh here instead of SESSION/repro.sh",
+            )
     return parser
 
 
